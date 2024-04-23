@@ -1,0 +1,50 @@
+name: Integration tests workflow
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.11.0'
+
+      - name: Install PostgreSQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-14 postgresql-contrib
+          sudo systemctl start postgresql
+
+      - name: Create Database
+        env:
+          POSTGRES_DB_NAME: ${{ secrets.POSTGRES_DB_NAME }}
+        run: |
+          echo "Creating database ${{secrets.POSTGRES_DB_NAME}}"
+          sudo -u postgres psql -c "CREATE DATABASE ${{secrets.POSTGRES_DB_NAME}};"
+
+      - name: Create user for webapp
+        env:
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          sudo -u postgres psql -c "CREATE USER ${{ secrets.POSTGRES_USER }} WITH PASSWORD '${{ secrets.POSTGRES_PASSWORD }}' CREATEDB;"
+          sudo sed -i "s/local   all             postgres                                peer/local   all             postgres                                md5/g" /etc/postgresql/*/main/pg_hba.conf
+          sudo sed -i "s/local   all             all                                     peer/local   all             all                                     md5/g" /etc/postgresql/*/main/pg_hba.conf
+          # sudo cat /etc/postgresql/*/main/pg_hba.conf
+          sudo systemctl restart postgresql
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        env:
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB_NAME: ${{ secrets.POSTGRES_DB_NAME }}
+        run: POSTGRES_HOST=${{ secrets.POSTGRES_HOST }} POSTGRES_USER=${{ secrets.POSTGRES_USER }} POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }} POSTGRES_DB_NAME=${{ secrets.POSTGRES_DB_NAME }} npm run test

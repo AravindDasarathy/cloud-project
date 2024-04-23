@@ -1,0 +1,42 @@
+name: Packer Validate workflow
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Zip the webapp
+        run: zip -r webapp.zip . -x "node_modules/*" && mv webapp.zip packer_utils/
+
+      - name: Install Packer
+        run: |
+             curl -O https://releases.hashicorp.com/packer/1.10.0/packer_1.10.0_linux_amd64.zip
+             unzip packer_1.10.0_linux_amd64.zip
+             sudo mv packer /usr/local/bin
+
+      - name: Initialise packer template
+        run: |
+            cd packer_utils
+            packer init .
+
+      - name: Format Packer template
+        run: |
+            cd packer_utils
+            packer fmt -check -recursive .
+
+      - name: Validate Packer template
+        run: |
+            cd packer_utils
+            packer validate \
+              -var "project_id=cloud-computing-dev" \
+              -var "source_image_family=centos-stream-8" \
+              -var "image_name=dev-centos" \
+              -var "zone=us-central1-a" \
+              -var "ssh_username=test-user" \
+              .

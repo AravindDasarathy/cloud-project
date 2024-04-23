@@ -1,0 +1,184 @@
+name: Packer Build workflow
+on:
+  pull_request:
+    branches: [ "main" ]
+    types: [closed]
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    env:
+      TEMPLATE_NAME: webapp-instance-template-${{ github.run_id }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.11.0'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install PostgreSQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-contrib
+          sudo systemctl start postgresql
+
+      - name: Create Database
+        env:
+          POSTGRES_DB_NAME: ${{ secrets.POSTGRES_DB_NAME }}
+        run: |
+          echo "Creating database ${{secrets.POSTGRES_DB_NAME}}"
+          sudo -u postgres psql -c "CREATE DATABASE ${{secrets.POSTGRES_DB_NAME}};"
+
+      - name: Create user for webapp
+        env:
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          sudo -u postgres psql -c "CREATE USER ${{ secrets.POSTGRES_USER }} WITH PASSWORD '${{ secrets.POSTGRES_PASSWORD }}' CREATEDB;"
+          sudo sed -i "s/local   all             postgres                                peer/local   all             postgres                                md5/g" /etc/postgresql/*/main/pg_hba.conf
+          sudo sed -i "s/local   all             all                                     peer/local   all             all                                     md5/g" /etc/postgresql/*/main/pg_hba.conf
+          # sudo cat /etc/postgresql/*/main/pg_hba.conf
+          sudo systemctl restart postgresql
+
+      - name: Run tests
+        env:
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB_NAME: ${{ secrets.POSTGRES_DB_NAME }}
+        run: POSTGRES_USER=${{ secrets.POSTGRES_USER }} POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }} POSTGRES_DB_NAME=${{ secrets.POSTGRES_DB_NAME }} npm run test
+
+      - name: Zip the webapp
+        run: zip -r webapp.zip . -x "node_modules/*" && mv webapp.zip packer_utils/
+
+      - id: 'auth'
+        uses: 'google-github-actions/auth@v2'
+        with:
+         credentials_json: '${{ secrets.GCP_PACKER_SERVICE_ACCOUNT_CREDENTIALS }}'
+
+      - name: 'Set up Google Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          install_components: 'beta'
+
+      - name: Install Packer
+        run: |
+             curl -O https://releases.hashicorp.com/packer/1.10.0/packer_1.10.0_linux_amd64.zip
+             unzip packer_1.10.0_linux_amd64.zip
+             sudo mv packer /usr/local/bin
+
+      - name: Initialise packer template
+        run: |
+            cd packer_utils
+            packer init .
+
+      - name: Format Packer template
+        run: |
+          cd packer_utils
+          packer fmt -check -recursive .
+
+      - name: Validate Packer template
+        run: |
+          cd packer_utils
+          packer validate \
+            -var "project_id=cloud-computing-dev" \
+            -var "source_image_family=centos-stream-8" \
+            -var "image_name=dev-centos" \
+            -var "zone=us-central1-a" \
+            -var "ssh_username=test-user" \
+            .
+
+      - name: Build Packer template
+        id: packer_build
+        run: |
+          cd packer_utils
+          packer build \
+            -var "project_id=cloud-computing-dev" \
+            -var "source_image_family=centos-stream-8" \
+            -var "image_name=dev-centos" \
+            -var "zone=us-central1-a" \
+            -var "ssh_username=test-user" \
+            . | tee ../packer-output.txt
+
+      - name: Extract Image ID
+        id: extract_image_id
+        run: |
+          echo "Last line of packer-output.txt: $(tail -1 packer-output.txt)"
+          IMAGE_ID=$(awk -F 'project: ' '/A disk image was created in the '\''cloud-computing-dev'\'' project:/ {print $2; exit}' packer-output.txt | xargs)
+          if [ -z "$IMAGE_ID" ]; then
+            echo "Image ID could not be found in Packer output."
+            exit 1
+          fi
+          echo "Extracted Image ID: $IMAGE_ID"
+          echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
+
+      - name: Create a new Instance Template
+        env:
+          IMAGE_ID: ${{ steps.extract_image_id.outputs.image_id }}
+        run: |
+          echo -e "${{ secrets.INSTANCE_STARTUP_SCRIPT }}" > startup-script.sh
+          gcloud compute instance-templates create ${TEMPLATE_NAME} \
+            --region=${{ secrets.REGION }} \
+            --instance-template-region=${{ secrets.REGION }} \
+            --machine-type=e2-medium \
+            --tags=deny-ssh,webapp-lb \
+            --network=webapp-vpc \
+            --subnet=webapp-subnet \
+            --metadata-from-file=startup-script=startup-script.sh \
+            --service-account=webapp-logger@cloud-computing-dev.iam.gserviceaccount.com \
+            --scopes=https://www.googleapis.com/auth/cloud-platform \
+            --image=projects/cloud-computing-dev/global/images/${IMAGE_ID} \
+            --boot-disk-size=100 \
+            --boot-disk-type=pd-standard \
+            --boot-disk-auto-delete \
+            --boot-disk-kms-key=projects/cloud-computing-dev/locations/${{ secrets.REGION }}/keyRings/${{ secrets.KEYRING }}/cryptoKeys/webapp-vm-key
+          if [ $? -ne 0 ]; then
+            echo "Failed to create instance template."
+            exit 1
+          fi
+
+      - name: Configure Managed Instance Group
+        run: |
+          gcloud compute instance-groups managed set-instance-template webapp-instance-group-manager \
+            --template=projects/cloud-computing-dev/regions/${{ secrets.REGION }}/instanceTemplates/${{ env.TEMPLATE_NAME }} \
+            --project=cloud-computing-dev \
+            --region=${{ secrets.REGION }}
+
+      - name: Start Rolling Update
+        run: |
+          gcloud beta compute instance-groups managed rolling-action start-update webapp-instance-group-manager \
+            --version=template=projects/cloud-computing-dev/regions/${{ secrets.REGION }}/instanceTemplates/${{ env.TEMPLATE_NAME }} \
+            --region=${{ secrets.REGION }} \
+            --max-unavailable=${{ secrets.MAX_UNAVAILABLE }} \
+            --max-surge=${{ secrets.MAX_SURGE }} \
+            --min-ready=60s \
+            --project=cloud-computing-dev
+
+      - name: Wait for Rolling Update to Complete
+        run: |
+          TIMEOUT=900
+          ELAPSED=0
+          SLEEP_DURATION=30
+          IS_REACHED="False"
+
+          while [[ $ELAPSED -lt $TIMEOUT ]]; do
+            IS_REACHED=$(gcloud compute instance-groups managed describe webapp-instance-group-manager --region=${{ secrets.REGION }} --format="value(status.versionTarget.isReached)")
+            if [[ $IS_REACHED == "True" ]]; then
+              echo "Instance group is updated. Rolling update successful."
+              exit 0
+            fi
+            echo "Waiting for instance group to update...  $(( TIMEOUT - ELAPSED ))s remaining."
+            sleep $SLEEP_DURATION
+            ELAPSED=$(( ELAPSED + SLEEP_DURATION ))
+          done
+
+          if [[ $IS_REACHED != "True" ]]; then
+            echo "Timed out waiting for instance group to update. Rolling update failed."
+            exit 1
+          fi

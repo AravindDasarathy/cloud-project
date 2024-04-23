@@ -1,0 +1,16 @@
+[Unit]
+Description=Web app developed for cloud assignment
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /home/csye6225/src/index.js
+WorkingDirectory=/home/csye6225
+EnvironmentFile=-/home/csye6225/app.env
+User=csye6225
+Group=csye6225
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=csye6225
+
+[Install]
+WantedBy=multi-user.target

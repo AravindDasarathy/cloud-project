@@ -1,0 +1,41 @@
+logging:
+  receivers:
+    webapp:
+      type: files
+      include_paths:
+      - /var/log/webapp/*.log
+  processors:
+    json_logging:
+      type: parse_json
+
+      time_key: timestamp
+      time_format: "%Y-%m-%dT%H:%M:%S"
+    map_app_severity:
+      type: modify_fields
+      fields:
+        severity:
+          move_from: jsonPayload.level
+  service:
+    pipelines:
+      webapp_pipeline:
+        receivers: [webapp]
+        processors: [json_logging, map_app_severity]
+metrics:
+  receivers:
+    hostmetrics:
+      type: hostmetrics
+      collection_interval: 60s
+  processors:
+    metrics_filter:
+      type: exclude_metrics
+      metrics_pattern:
+      - agent.googleapis.com/agent/*
+      - agent.googleapis.com/disk/*
+      - agent.googleapis.com/gpu/*
+      - agent.googleapis.com/pagefile/*
+      - agent.googleapis.com/swap/*
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [hostmetrics]
+        processors: [metrics_filter]
